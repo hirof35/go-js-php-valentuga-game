@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>ヴァーレントゥーガ Web Full-Prototype</title>
+    <style>
+        body { background-color: #222; color: #fff; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; margin: 20px; }
+        #strategy-panel { background: #333; padding: 15px; border-radius: 8px; width: 780px; margin-bottom: 15px; border: 1px solid #555; display: flex; justify-content: space-between; align-items: center; }
+        .info-box span { font-weight: bold; font-size: 15px; margin-right: 15px; }
+        .owner-player { color: #3498db; }
+        .owner-enemy { color: #e74c3c; }
+        button { padding: 8px 14px; font-size: 13px; cursor: pointer; background: #444; color: white; border: 1px solid #666; border-radius: 4px; margin-left: 3px; }
+        button:hover { background: #555; }
+        button:disabled { background: #222; color: #555; cursor: not-allowed; }
+        #btn-start { background: #27ae60; border-color: #2ecc71; font-weight: bold; }
+        #btn-start:hover { background: #2ecc71; }
+        .btn-system { background: #2980b9; border-color: #3498db; }
+        .btn-system-load { background: #e67e22; border-color: #f39c12; }
+        canvas { border: 2px solid #555; background-color: #111; box-shadow: 0 0 20px rgba(0,0,0,0.5); }
+    </style>
+</head>
+<body>
+
+    <div id="strategy-panel">
+        <div class="info-box">
+            <span>領地: <span id="lbl-territory-name">---</span> (<span id="lbl-territory-owner">---</span>)</span>
+            <span>資金: <span id="lbl-gold" style="color: #f1c40f;">0</span> G</span>
+        </div>
+        <div>
+            <button id="btn-hire-knight" onclick="hireUnit('knight')">雇用: 騎士 (200G)</button>
+            <button id="btn-hire-mage" onclick="hireUnit('mage')">雇用: 魔術 (300G)</button>
+            <button id="btn-start" onclick="startBattle()">侵攻開始！</button>
+            <button class="btn-system" onclick="saveGame()">セーブ</button>
+            <button class="btn-system-load" onclick="loadGame()">ロード</button>
+            <button id="btn-reset" style="background: #c0392b; border-color: #e74c3c;" onclick="resetGame()">最初から</button>
+        </div>
+    </div>
+
+    <canvas id="stage" width="800" height="450"></canvas>
+
+<script>
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+
+// 各サーバーのURL設定
+const PHP_URL = 'http://localhost:8000/save.php';
+const GO_URL = 'http://localhost:8080';
+
+let units = [];
+let projectiles = [];
+// ★ 中央の壁を取り除くため、配列を空に変更しました
+let obstacles = []; 
+let currentBattleId = "";
+let currentTerritoryId = "";
+let isGameOver = true; 
+let hiredCount = 0;
+
+// 状態リフレッシュ
+async function initStatus() {
+    try {
+        const pRes = await fetch(GO_URL + '/api/player');
+        const pData = await pRes.json();
+        document.getElementById("lbl-gold").innerText = pData.gold;
+
+        const tRes = await fetch(GO_URL + '/api/map');
+        const tData = await tRes.json();
+        document.getElementById("lbl-territory-name").innerText = tData.name;
+        
+        const ownerLbl = document.getElementById("lbl-territory-owner");
+        ownerLbl.innerText = tData.owner === "player" ? "自軍領" : "敵軍領";
+        ownerLbl.className = tData.owner === "player" ? "owner-player" : "owner-enemy";
+        
+        if(tData.owner === "player") {
+            document.getElementById("btn-start").disabled = true;
+            document.getElementById("btn-start").innerText = "制圧済み";
+        } else {
+            document.getElementById("btn-start").disabled = false;
+            document.getElementById("btn-start").innerText = "侵攻開始！";
+        }
+        document.getElementById("btn-hire-knight").disabled = false;
+        document.getElementById("btn-hire-mage").disabled = false;
+    } catch (e) {
+        console.error("ステータス初期化エラー:", e);
+    }
+}
+
+// 雇用処理
+async function hireUnit(type) {
+    try {
+        const response = await fetch(GO_URL + '/api/hire', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ unit_type: type })
+        });
+        const data = await response.json();
+
+        if (response.ok) {
+            alert(data.message);
+            document.getElementById("lbl-gold").innerText = data.current_gold;
+            hiredCount++;
+            let spawnY = 80 + (hiredCount * 50) % 300;
+            units.push(new Unit(100 + hiredCount, "player", 50, spawnY, type));
+        } else {
+            alert(data.message);
+        }
+    } catch (e) {
+        alert("雇用通信に失敗しました。");
+    }
+}
+
+// 戦闘開始
+async function startBattle() {
+    try {
+        const response = await fetch(GO_URL + '/api/battle/start');
+        const data = await response.json();
+        
+        currentBattleId = data.battle_id;
+        currentTerritoryId = data.territory_id;
+        projectiles = [];
+        isGameOver = false;
+
+        data.units.forEach(u => {
+            if (u.team === "enemy" || !units.some(ex => ex.id === u.id)) {
+                units.push(new Unit(u.id, u.team, u.x, u.y, u.type));
+            }
+        });
+
+        document.getElementById("btn-start").disabled = true;
+        document.getElementById("btn-hire-knight").disabled = true;
+        document.getElementById("btn-hire-mage").disabled = true;
+    } catch (e) {
+        alert("戦闘開始リクエストに失敗しました。");
+    }
+}
+
+// 手動セーブ機能
+async function saveGame() {
+    try {
+        const goRes = await fetch(GO_URL + '/api/sync/save');
+        const currentData = await goRes.json();
+
+        const phpRes = await fetch(PHP_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(currentData)
+        });
+        const result = await phpRes.json();
+        alert(result.message);
+    } catch (e) {
+        alert("セーブに失敗。PHPサーバー(ポート8000)の起動を確認してください。");
+    }
+}
+
+// ロード機能
+async function loadGame() {
+    try {
+        const phpRes = await fetch(PHP_URL);
+        const saveData = await phpRes.json();
+
+        if (saveData.status === "no_file") {
+            alert("セーブデータがまだ存在しません。");
+            return;
+        }
+
+        await fetch(GO_URL + '/api/sync/load', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(saveData)
+        });
+
+        alert("セーブデータをロードしました！");
+        units = []; 
+        initStatus();
+    } catch (e) {
+        alert("ロード失敗。");
+    }
+}
+// 最初からやり直す機能
+async function resetGame() {
+    if (!confirm("本当に最初からやり直しますか？セーブデータも初期化されます。")) {
+        return;
+    }
+
+    try {
+        // 1. Go側のメモリを初期化
+        const goRes = await fetch(GO_URL + '/api/sync/reset', { method: 'POST' });
+        
+        // 2. 初期化したデータをPHP（セーブファイル）にも上書き保存して消去
+        const initData = {
+            gold: 1000,
+            territory_owner: "enemy"
+        };
+        await fetch(PHP_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(initData)
+        });
+
+        alert("ゲームを初期状態にリセットしました！");
+        
+        // 画面上のユニットを全消去して状態をリフレッシュ
+        units = [];
+        projectiles = [];
+        hiredCount = 0;
+        isGameOver = true;
+        
+        // ステータス表示の再取得
+        initStatus();
+        
+    } catch (e) {
+        alert("リセット処理に失敗しました。");
+    }
+}
+
+// ユニットエンティティ
+class Unit {
+    constructor(id, team, x, y, type) {
+        this.id = id; this.team = team; this.x = x; this.y = y; this.type = type;
+        this.hp = type === "knight" ? 150 : 80;
+        
+        // ★ ここを追加：敵軍（enemy）ならHPをバッサリ半分にする
+        if (this.team === "enemy") { this.hp = Math.floor(this.hp * 0.5); }
+        
+        this.maxHp = this.hp;
+        this.speed = type === "knight" ? 1.5 : 1.0;
+        
+        // ★ ここを追加：ついでに敵の移動速度も少し遅くして鈍重に
+        if (this.team === "enemy") { this.speed *= 0.7; }
+
+        this.range = type === "knight" ? 22 : 160;
+        this.atkCooldown = 0; this.radius = 12;
+        this.vx = 0; this.vy = 0; this.friction = 0.85;
+    }
+
+    applyKnockback(angle, force) {
+        this.vx += Math.cos(angle) * force;
+        this.vy += Math.sin(angle) * force;
+    }
+
+    update(opponents) {
+        if (this.hp <= 0) return;
+        if (this.atkCooldown > 0) this.atkCooldown--;
+
+        this.x += this.vx; this.y += this.vy;
+        this.vx *= this.friction; this.vy *= this.friction;
+
+        // 壁判定オブジェクトの衝突計算処理（配列が空なのでスキップされます）
+        obstacles.forEach(wall => {
+            if (this.x + this.radius > wall.x && this.x - this.radius < wall.x + wall.w && this.y + this.radius > wall.y && this.y - this.radius < wall.y + wall.h) {
+                let oL = (this.x + this.radius) - wall.x; let oR = (wall.x + wall.w) - (this.x - this.radius);
+                let oT = (this.y + this.radius) - wall.y; let oB = (wall.y + wall.h) - (this.y - this.radius);
+                let min = Math.min(oL, oR, oT, oB);
+                if (min === oL) { this.x -= oL; this.vx = -Math.abs(this.vx)*0.5; }
+                else if (min === oR) { this.x += oR; this.vx = Math.abs(this.vx)*0.5; }
+                else if (min === oT) { this.y -= oT; this.vy = -Math.abs(this.vy)*0.5; }
+                else if (min === oB) { this.y += oB; this.vy = Math.abs(this.vy)*0.5; }
+            }
+        });
+
+        this.x = Math.max(this.radius, Math.min(canvas.width - this.radius, this.x));
+        this.y = Math.max(this.radius, Math.min(canvas.height - this.radius, this.y));
+
+        if (isGameOver) return;
+
+        let target = null; let minDist = Infinity;
+        for (let opp of opponents) {
+            if (opp.hp <= 0) continue;
+            let dist = Math.hypot(opp.x - this.x, opp.y - this.y);
+            if (dist < minDist) { minDist = dist; target = opp; }
+        }
+        if (!target) return;
+
+        if (Math.hypot(this.vx, this.vy) < 0.5) {
+            if (minDist > this.range) {
+                let angle = Math.atan2(target.y - this.y, target.x - this.x);
+                this.x += Math.cos(angle) * this.speed; this.y += Math.sin(angle) * this.speed;
+            } else if (this.atkCooldown === 0) {
+                let angle = Math.atan2(target.y - this.y, target.x - this.x);
+                if (this.type === "knight") {
+                    target.hp -= 20; target.applyKnockback(angle, 5); this.atkCooldown = 40;
+                } else {
+                    projectiles.push(new Projectile(this.x, this.y, target, this.team)); this.atkCooldown = 90;
+                }
+            }
+        }
+    }
+
+    draw() {
+        if (this.hp <= 0) return;
+        ctx.beginPath();
+        if (this.team === "player") { ctx.fillStyle = this.type === "knight" ? "#3498db" : "#8e44ad"; }
+        else { ctx.fillStyle = this.type === "knight" ? "#e74c3c" : "#e67e22"; }
+        ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2); ctx.fill();
+
+        const barW = 24; const barH = 4;
+        ctx.fillStyle = "#555"; ctx.fillRect(this.x - barW/2, this.y - this.radius - 8, barW, barH);
+        ctx.fillStyle = "#2ecc71"; ctx.fillRect(this.x - barW/2, this.y - this.radius - 8, barW * (this.hp / this.maxHp), barH);
+    }
+}
+
+// 遠隔魔法クラス
+class Projectile {
+    constructor(x, y, target, team) { this.x = x; this.y = y; this.target = target; this.team = team; this.speed = 5; this.damage = 30; this.active = true; }
+    update() {
+        if (this.target.hp <= 0) { this.active = false; return; }
+        let angle = Math.atan2(this.target.y - this.y, this.target.x - this.x);
+        this.x += Math.cos(angle) * this.speed; this.y += Math.sin(angle) * this.speed;
+
+        obstacles.forEach(wall => {
+            if (this.x > wall.x && this.x < wall.x + wall.w && this.y > wall.y && this.y < wall.y + wall.h) this.active = false;
+        });
+
+        if (Math.hypot(this.target.x - this.x, this.target.y - this.y) < this.target.radius && this.active) {
+            this.target.hp -= this.damage; this.target.applyKnockback(angle, 12); this.active = false;
+        }
+    }
+    draw() {
+        if (!this.active) return;
+        ctx.beginPath(); ctx.fillStyle = this.team === "player" ? "#00ffff" : "#ffaa00";
+        ctx.arc(this.x, this.y, 5, 0, Math.PI * 2); ctx.fill();
+    }
+}
+
+// 毎フレーム勝敗判定
+async function checkGameEnd() {
+    if (isGameOver) return;
+    const alivePlayers = units.filter(u => u.team === "player" && u.hp > 0);
+    const aliveEnemies = units.filter(u => u.team === "enemy" && u.hp > 0);
+
+    let result = "";
+    if (alivePlayers.length === 0) result = "enemy_win";
+    if (aliveEnemies.length === 0) result = "player_win";
+
+    if (result !== "") {
+        isGameOver = true;
+        try {
+            const response = await fetch(GO_URL + '/api/battle/result', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ battle_id: currentBattleId, territory_id: currentTerritoryId, result: result })
+            });
+            const data = await response.json();
+            alert(data.message);
+
+            if(result === "player_win") {
+                await saveGame();
+            }
+        } catch (e) {
+            console.error("戦闘結果送信エラー:", e);
+        }
+
+        initStatus();
+    }
+}
+
+function gameLoop() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    obstacles.forEach(wall => {
+        ctx.fillStyle = wall.color; ctx.fillRect(wall.x, wall.y, wall.w, wall.h);
+        ctx.strokeStyle = "#666"; ctx.strokeRect(wall.x, wall.y, wall.w, wall.h);
+    });
+
+    const players = units.filter(u => u.team === "player");
+    const enemies = units.filter(u => u.team === "enemy");
+
+    units.forEach(unit => {
+        unit.update(unit.team === "player" ? enemies : players);
+        unit.draw();
+    });
+
+    projectiles = projectiles.filter(p => p.active);
+    projectiles.forEach(p => { p.update(); p.draw(); });
+
+    checkGameEnd();
+    requestAnimationFrame(gameLoop);
+}
+
+// 起動開始
+initStatus();
+gameLoop();
+</script>
+</body>
+</html>
